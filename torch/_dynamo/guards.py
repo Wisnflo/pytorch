@@ -108,6 +108,7 @@ from torch._guards import (
     GuardBuilderBase,
     GuardEnvExpr,
     GuardSource,
+    InputStorageLayout,
     Source,
     StorageOverlap,
 )
@@ -906,12 +907,48 @@ def uninteresting_files() -> set[str]:
 _CLOSURE_VARS: dict[str, object] | None = None
 
 
+def check_input_storage_layout(
+    inputs: list[object],
+    storage_groups: tuple[tuple[int, ...], ...],
+    duplicate_groups: tuple[tuple[int, ...], ...],
+    offsets: tuple[int | None, ...],
+) -> bool:
+    from torch._functorch._aot_autograd.input_output_analysis import (
+        input_storage_layout,
+    )
+
+    try:
+        actual_groups, actual_duplicates, _ = input_storage_layout(inputs)
+    except RuntimeError:
+        return False
+    tensor_indices = {i for group in actual_groups for i in group}
+    expected_groups = tuple(
+        projected
+        for group in storage_groups
+        if (projected := tuple(i for i in group if i in tensor_indices))
+    )
+    expected_duplicates = tuple(
+        projected
+        for group in duplicate_groups
+        if len(projected := tuple(i for i in group if i in tensor_indices)) > 1
+    )
+    if actual_groups != expected_groups or actual_duplicates != expected_duplicates:
+        return False
+    return all(
+        offset is None
+        or not isinstance(tensor, torch.Tensor)
+        or tensor.storage_offset() == offset
+        for tensor, offset in zip(inputs, offsets, strict=True)
+    )
+
+
 def _get_closure_vars() -> dict[str, object]:
     global _CLOSURE_VARS
     if _CLOSURE_VARS is None:
         _CLOSURE_VARS = {
             "___check_type_id": check_type_id,
             "___check_obj_id": check_obj_id,
+            "___check_input_storage_layout": check_input_storage_layout,
             "___odict_getitem": collections.OrderedDict.__getitem__,
             "___key_to_id": key_to_id,
             "___dict_version": dict_version,
@@ -6087,6 +6124,15 @@ class CheckFunctionManager:
                     [code_part],
                     None,
                 )
+                add_code_part(code_part, None, True)
+            elif isinstance(guard, InputStorageLayout):
+                sources = ", ".join(source.name for source in guard.input_sources)
+                code_part = (
+                    f"___check_input_storage_layout([{sources}], "
+                    f"{guard.storage_groups!r}, {guard.duplicate_groups!r}, "
+                    f"{guard.storage_offsets!r})"
+                )
+                builder.add_python_lambda_leaf_guard_to_root([code_part], [code_part])
                 add_code_part(code_part, None, True)
             elif isinstance(guard, StorageOverlap):
                 overlapping_guard_managers = [

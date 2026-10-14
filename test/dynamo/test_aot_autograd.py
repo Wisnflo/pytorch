@@ -22,6 +22,7 @@ from torch._functorch.aot_autograd import _aot_export_function, create_functiona
 from torch._functorch.partitioners import _extract_fwd_bwd_modules
 from torch._guards import CompileContext, StorageOverlap, TracingContext
 from torch._inductor.graph import GraphLowering
+from torch._inductor.utils import fresh_cache
 from torch._inductor.virtualized import V
 from torch._subclasses.fake_tensor import (
     allow_non_fake_inputs_temporarily,
@@ -36,7 +37,10 @@ from torch.testing._internal.common_device_type import (
     instantiate_device_type_tests,
     onlyAccelerator,
 )
-from torch.testing._internal.common_utils import compare_equal_outs_and_grads
+from torch.testing._internal.common_utils import (
+    compare_equal_outs_and_grads,
+    parametrize,
+)
 from torch.utils._sympy.symbol import make_symbol, SymT
 from torch.utils._sympy.value_ranges import ValueRanges
 
@@ -2003,6 +2007,112 @@ class AotAutogradFallbackTestsDevice(torch._inductor.test_case.TestCase):
         )
 
 
+class SyntheticBaseLayoutTests(torch._inductor.test_case.TestCase):
+    @parametrize("backend", ["aot_eager", "inductor"])
+    @parametrize("case", ["offset", "storage"])
+    def test_cached_layout_change(self, device, backend, case):
+        def fn(x, y):
+            x.add_(1)
+            y.mul_(2)
+            return x + y
+
+        def first_inputs():
+            base = torch.arange(1.0, 6.0 if case == "offset" else 5.0, device=device)
+            return base[:4], base[1:5] if case == "offset" else base.view_as(base)
+
+        def second_inputs():
+            base = torch.arange(1.0, 6.0, device=device)
+            if case == "offset":
+                return base[:4], base[:4], base
+            return base[:4].clone(), torch.arange(10.0, 50.0, 10.0, device=device), None
+
+        counter = CompileCounterWithBackend(backend)
+        compiled = torch.compile(fn, backend=counter, dynamic=False, fullgraph=True)
+        with (
+            torch.no_grad(),
+            torch._functorch.config.patch(enable_autograd_cache=False),
+        ):
+            compiled(*first_inputs())
+            self.assertEqual(counter.frame_count, 1)
+            for _ in range(2):
+                xe, ye, be = second_inputs()
+                xc, yc, bc = second_inputs()
+                expected = fn(xe, ye).clone()
+                actual = compiled(xc, yc).clone()
+                self.assertEqual(actual, expected)
+                self.assertEqual(xc, xe)
+                self.assertEqual(yc, ye)
+                self.assertEqual(bc, be)
+                self.assertEqual(counter.frame_count, 2)
+
+    @parametrize("case", ["offset", "storage"])
+    def test_layout_guards_after_aot_cache_hit(self, device, case):
+        from torch._dynamo.utils import counters
+
+        def fn(x, y):
+            x.add_(1)
+            y.mul_(2)
+            return x + y
+
+        def warm_inputs():
+            base = torch.arange(1.0, 6.0 if case == "offset" else 5.0, device=device)
+            return base[:4], base[1:5] if case == "offset" else base.view_as(base)
+
+        with (
+            fresh_cache(),
+            torch.no_grad(),
+            torch._functorch.config.patch(enable_autograd_cache=True),
+            torch._inductor.config.patch(fx_graph_cache=True),
+        ):
+            counters.clear()
+            counter = CompileCounterWithBackend("inductor")
+            compiled = torch.compile(fn, backend=counter, dynamic=False, fullgraph=True)
+            compiled(*warm_inputs())
+            torch._dynamo.reset()
+            compiled(*warm_inputs())
+            self.assertGreater(counters["aot_autograd"]["autograd_cache_hit"], 0)
+            self.assertEqual(counter.frame_count, 2)
+
+            be = torch.arange(1.0, 6.0, device=device)
+            bc = be.clone()
+            xe, xc = be[:4], bc[:4]
+            if case == "offset":
+                ye, yc = be[:4], bc[:4]
+            else:
+                ye = torch.arange(10.0, 50.0, 10.0, device=device)
+                yc = ye.clone()
+            expected = fn(xe, ye).clone()
+            actual = compiled(xc, yc).clone()
+            self.assertEqual(actual, expected)
+            self.assertEqual(xc, xe)
+            self.assertEqual(yc, ye)
+            self.assertEqual(bc, be)
+            self.assertEqual(counter.frame_count, 3)
+
+    @parametrize("backend", ["aot_eager", "inductor"])
+    def test_disjoint_views_preserve_reuse(self, device, backend):
+        def fn(x, y):
+            x.add_(1)
+            y.mul_(2)
+            return x + y
+
+        counter = CompileCounterWithBackend(backend)
+        compiled = torch.compile(fn, backend=counter, dynamic=False, fullgraph=True)
+        with (
+            torch.no_grad(),
+            torch._functorch.config.patch(enable_autograd_cache=False),
+        ):
+            compiled(torch.ones(4, device=device), torch.ones(4, device=device))
+            expected_base = torch.arange(1.0, 9.0, device=device)
+            actual_base = expected_base.clone()
+            expected = fn(expected_base[:4], expected_base[4:]).clone()
+            actual = compiled(actual_base[:4], actual_base[4:]).clone()
+            self.assertEqual(actual, expected)
+            self.assertEqual(actual_base, expected_base)
+            self.assertEqual(counter.frame_count, 1)
+
+
+instantiate_device_type_tests(SyntheticBaseLayoutTests, globals(), only_for="cpu")
 instantiate_device_type_tests(AotAutogradFallbackTestsDevice, globals())
 
 if __name__ == "__main__":

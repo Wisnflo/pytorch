@@ -81,6 +81,7 @@ from .aot_autograd_result import (
     GenericAOTAutogradResult,
     SerializedGraphModule,
 )
+from .input_output_analysis import input_storage_layout
 from .runtime_wrappers import (
     CompilerWrapper,
     SerializableCompiledFunction,
@@ -615,6 +616,7 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
         # includes some system info.
         self.aot_config = aot_config
         self.act_input_paths = tuple(act_input_paths)
+        self.input_storage_layout = input_storage_layout(example_inputs)
         self._record_runtime_state(gm)
         self.saved_tensors_hooks_fx_wrap_cache_hashes = (
             _collect_saved_tensors_hooks_fx_wrap_cache_hashes(gm)

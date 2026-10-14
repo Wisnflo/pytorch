@@ -492,6 +492,16 @@ class StorageOverlap(GuardEnvExpr):
     non_overlapping_sources: list[Source]
 
 
+@dataclasses.dataclass(frozen=True)
+class InputStorageLayout(GuardEnvExpr):
+    """Input relationships and specialized offsets used by a synthetic base."""
+
+    input_sources: tuple[Source, ...]
+    storage_groups: tuple[tuple[int, ...], ...]
+    duplicate_groups: tuple[tuple[int, ...], ...]
+    storage_offsets: tuple[int | None, ...]
+
+
 """
 Checkpointable is an interface for driving state snapshotting, left purposely vague for now.
 

@@ -41,6 +41,7 @@ from torch._guards import (
     CompileContext,
     detect_fake_mode,
     DuplicateInputs,
+    InputStorageLayout,
     tracing,
     TracingContext,
 )
@@ -74,6 +75,7 @@ from .graph_capture_wrappers import aot_dispatch_subclass
 from .input_output_analysis import (
     compute_overlapping_inputs,
     create_synthetic_base_metadata,
+    input_storage_layout,
     remove_dupe_metadata,
 )
 from .logging_utils import describe_input, format_guard_bug_msg, track_graph_compiling
@@ -1868,6 +1870,8 @@ class AOTSyntheticBaseWrapper(CompilerWrapper):
         default_factory=lambda: collections.defaultdict(list)
     )
     other_arg_indices: list[int] = field(default_factory=list)
+    input_layout_guard: InputStorageLayout | None = None
+    input_layout_guard_required: bool = False
 
     def pre_compile(
         self,
@@ -1915,6 +1919,15 @@ class AOTSyntheticBaseWrapper(CompilerWrapper):
 
         fw_metadata={str(fw_metadata)}
                 """
+            )
+
+        if self.input_layout_guard_required and self.input_layout_guard is None:
+            from torch._subclasses.fake_tensor import (
+                UnsupportedMutationAliasingException,
+            )
+
+            raise UnsupportedMutationAliasingException(
+                "Synthetic-base inputs require Dynamo sources for storage layout guards"
             )
 
         if len(fw_metadata.input_info) != len(synthetic_base_info):
@@ -2043,6 +2056,12 @@ class AOTSyntheticBaseWrapper(CompilerWrapper):
     ) -> Callable[..., Any]:
         if not self.needs_post_compile:
             return compiled_fn
+
+        if self.input_layout_guard is not None:
+            if tracing_context := TracingContext.try_get():
+                tracing_context.guards_context.aotautograd_guards.append(
+                    self.input_layout_guard
+                )
 
         from .codegen import PySourceBuilder
 
@@ -3893,7 +3912,31 @@ def pre_compile(
     Runs a sequence of wrappers on the given function and arguments.
     Mutates wrappers in place.
     """
+    layout_guard = None
+    sources = aot_config.aot_autograd_arg_pos_to_source
+    guard_required = TracingContext.try_get() is not None
+    if guard_required and sources is not None:
+        tensor_indices = [
+            i for i, value in enumerate(flat_args) if isinstance(value, Tensor)
+        ]
+        if all(i < len(sources) and sources[i] is not None for i in tensor_indices):
+            try:
+                groups, duplicates, offsets = input_storage_layout(
+                    [flat_args[i] for i in tensor_indices]
+                )
+            except RuntimeError:
+                pass
+            else:
+                layout_guard = InputStorageLayout(
+                    tuple(sources[i] for i in tensor_indices),
+                    groups,
+                    duplicates,
+                    offsets,
+                )
     for wrapper in wrappers:
+        if isinstance(wrapper, AOTSyntheticBaseWrapper):
+            wrapper.input_layout_guard = layout_guard
+            wrapper.input_layout_guard_required = guard_required
         flat_fn, flat_args, flat_args_descs, fw_metadata = wrapper.pre_compile(
             flat_fn, flat_args, flat_args_descs, aot_config, fw_metadata=fw_metadata
         )

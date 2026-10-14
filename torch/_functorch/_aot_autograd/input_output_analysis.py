@@ -11,6 +11,7 @@ In particular, the following analyses are provided:
 
 import contextlib
 import itertools
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -38,6 +39,35 @@ from .utils import strict_zip
 
 
 zip = strict_zip
+
+
+def input_storage_layout(
+    inputs: Sequence[Any],
+) -> tuple[
+    tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...], tuple[int | None, ...]
+]:
+    """Stable storage/identity partitions without specializing symbolic offsets."""
+
+    storage_groups: dict[int, list[int]] = {}
+    duplicate_groups: dict[int, list[int]] = {}
+    offsets: list[int | None] = [None] * len(inputs)
+    for i, tensor in enumerate(inputs):
+        if not isinstance(tensor, Tensor) or tensor.layout != torch.strided:
+            continue
+        storage = tensor.untyped_storage()
+        storage_groups.setdefault(storage._cdata, []).append(i)
+        duplicate_groups.setdefault(id(tensor), []).append(i)
+    for group in storage_groups.values():
+        if len(group) > 1:
+            for i in group:
+                offset = inputs[i].storage_offset()
+                if not isinstance(offset, torch.SymInt):
+                    offsets[i] = offset
+    return (
+        tuple(tuple(group) for group in storage_groups.values()),
+        tuple(tuple(group) for group in duplicate_groups.values() if len(group) > 1),
+        tuple(offsets),
+    )
 
 
 # The only output types whose base_idx is an index into the graph inputs. The
